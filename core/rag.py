@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 from pathlib import Path
 
@@ -32,33 +31,20 @@ async def structured_ainvoke(schema, model_env: str, system: str, user: str):
     ])
 
 
-def _should_read_file(path, skip_dirs) -> bool:
-    if any(part.lower() in skip_dirs for part in path.parts):
-        return False
-    if path.stat().st_size > 350_000:
-        return False
-    TEXT_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs",
-                       ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php", ".swift",
-                       ".kt", ".scala", ".md", ".rst", ".txt", ".toml", ".yaml",
-                       ".yml", ".json", ".ini", ".cfg", ".xml", ".html", ".css", ".sql"}
-    IMPORTANT_NAMES = {"readme", "requirements", "pyproject", "setup", "package",
-                       "build", "dockerfile", "makefile", "config", "main", "app",
-                       "server", "cli", "train", "infer", "pipeline", "agent"}
-    stem = path.stem.lower()
-    return path.suffix.lower() in TEXT_EXTENSIONS or stem in IMPORTANT_NAMES
-
-
 def iter_documents(repo_path: Path, skip_dirs: set) -> list[dict[str, str]]:
-    from .github import _read_text as _rt
+    from .github import _should_read_file, _read_text
     docs = []
     for path in repo_path.rglob("*"):
         if not path.is_file():
             continue
+        rel = path.relative_to(repo_path)
+        if not _should_read_file(path) if False else True:
+            continue
         if not _should_read_file(path, skip_dirs):
             continue
-        text = _rt(path, 80_000)
+        text = _read_text(path, 80_000)
         if text.strip():
-            docs.append({"path": str(path.relative_to(repo_path)), "text": text})
+            docs.append({"path": str(rel), "text": text})
     return docs
 
 
@@ -112,6 +98,7 @@ async def screen_snapshot(requirement: str, plan: QueryPlan, snapshot: RepoSnaps
         return await structured_ainvoke(ScreeningDecision, "SCREEN_MODEL", system, user)
     except Exception as exc:
         print(f"[warn] screening failed: {exc}")
+        import re
         score = 30
         text = f"{snapshot.candidate.full_name} {snapshot.readme[:2000]}".lower()
         for w in re.findall(r"[\w-]+", requirement.lower()):
