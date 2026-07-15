@@ -1,0 +1,30 @@
+{
+  "raw_requirement": "architectural style recognition python code",
+  "domain": "architecture",
+  "target_object": ["architectural style", "building facade"],
+  "task": ["recognition", "classification"],
+  "modality": ["image"],
+  "language": ["Python"],
+  "strict_terms": ["architectural style", "style recognition", "style classification"],
+  "technical_methods": ["CNN", "ResNet", "image classifier", "transfer learning"],
+  "allow_related": true,
+  "related_terms": [
+    "architectural image classification",
+    "building facade classification",
+    "facade classification",
+    "architectural heritage classification",
+    "building type classification",
+    "building age classification"
+  ],
+  "exclude_terms": [
+    "generic deep learning course",
+    "software architecture",
+    "awesome list",
+    "blog collection",
+    "paper list without code",
+    "LLM/agent/chatbot"
+  ],
+  "min_projects": 6,
+  "max_results": 24,
+  "keep": 8
+}
