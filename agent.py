@@ -1,27 +1,18 @@
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+"""GitHub Code Research Agent — search, analyze, recommend."""
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
-import re
-import shutil
-import subprocess
 import sys
-import textwrap
-import time
 import warnings
-import zipfile
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
-import requests
 from dotenv import load_dotenv
-from langchain_core.embeddings import Embeddings
-from pydantic import BaseModel, Field
-
 
 warnings.filterwarnings("ignore", message="`langchain-community` is being sunset.*", category=DeprecationWarning)
 
@@ -32,281 +23,210 @@ REPOS_DIR = WORKSPACE / "repos"
 REPORTS_DIR = WORKSPACE / "reports"
 INDEX_DIR = Path(os.getenv("AGENT_INDEX_DIR", Path.home() / ".github_code_agent_cache" / "indexes"))
 
-TEXT_EXTENSIONS = {
-    ".py",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".java",
-    ".go",
-    ".rs",
-    ".cpp",
-    ".c",
-    ".h",
-    ".hpp",
-    ".cs",
-    ".rb",
-    ".php",
-    ".swift",
-    ".kt",
-    ".scala",
-    ".m",
-    ".mm",
-    ".r",
-    ".jl",
-    ".sh",
-    ".ps1",
-    ".md",
-    ".rst",
-    ".txt",
-    ".toml",
-    ".yaml",
-    ".yml",
-    ".json",
-    ".ini",
-    ".cfg",
-    ".xml",
-    ".html",
-    ".css",
-    ".sql",
-}
 
-IMPORTANT_NAMES = {
-    "readme",
-    "requirements",
-    "pyproject",
-    "setup",
-    "package",
-    "pom",
-    "build",
-    "dockerfile",
-    "makefile",
-    "environment",
-    "config",
-    "main",
-    "app",
-    "server",
-    "cli",
-    "train",
-    "infer",
-    "pipeline",
-    "agent",
-}
-
-SKIP_DIRS = {
-    ".git",
-    ".hg",
-    ".svn",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "node_modules",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".cache",
-    "target",
-    "vendor",
-    "data",
-    "datasets",
-    "checkpoints",
-    "weights",
-}
+def _ensure_dirs():
+    for p in (WORKSPACE, REPOS_DIR, REPORTS_DIR, INDEX_DIR):
+        p.mkdir(parents=True, exist_ok=True)
 
 
-class QueryPlan(BaseModel):
-    search_queries: list[str] = Field(description="GitHub search queries")
-    must_have: list[str] = Field(description="Capabilities that relevant projects should have")
-    exclude_if: list[str] = Field(description="Signals that indicate an irrelevant project")
-    preferred_languages: list[str] = Field(default_factory=list)
+def _validate_config():
+    if os.getenv("CHAT_MODEL_PROVIDER", "deepseek").lower() == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"):
+        raise SystemExit(f"Missing DEEPSEEK_API_KEY. See {ROOT / '.env.example'}")
 
 
-class RequirementSpec(BaseModel):
-    raw_requirement: str
-    domain: str = ""
-    target_object: list[str] = Field(default_factory=list)
-    task: list[str] = Field(default_factory=list)
-    modality: list[str] = Field(default_factory=list)
-    language: list[str] = Field(default_factory=lambda: ["Python"])
-    strict_terms: list[str] = Field(default_factory=list)
-    technical_methods: list[str] = Field(default_factory=list)
-    allow_related: bool = True
-    related_terms: list[str] = Field(default_factory=list)
-    exclude_terms: list[str] = Field(default_factory=list)
-    min_projects: int = 6
-    max_results: int = 20
-    keep: int = 8
-
-
-class ScreeningDecision(BaseModel):
-    keep: bool
-    relevance_score: int = Field(ge=0, le=100)
-    reason: str
-    method_guess: str
-    mismatch_signals: list[str] = Field(default_factory=list)
-
-
-class ProjectAnalysis(BaseModel):
-    project_name: str
-    address: str
-    fit_score: int = Field(ge=0, le=100)
-    method: str
-    code_structure: str
-    core_files: list[str]
-    strengths: list[str]
-    weaknesses: list[str]
-    reusable_ideas: list[str]
-    implementation_risks: list[str]
-    evidence: list[str]
-
-
-class ProjectTableRow(BaseModel):
-    project_name: str
-    address: str
-    fit_score: int
-    method: str
-    code_structure: str
-    conclusion: str
-
-
-class FinalRecommendation(BaseModel):
-    table: list[ProjectTableRow]
-    best_project: str
-    best_project_reason: str
-    recommended_code_solution: str
-    architecture_steps: list[str]
-    rag_enhancement_plan: list[str]
-    next_actions: list[str]
-
-
-@dataclass
-class RepoCandidate:
-    full_name: str
-    html_url: str
-    clone_url: str
-    description: str
-    language: str
-    stars: int
-    forks: int
-    updated_at: str
-    default_branch: str = "main"
-
-
-@dataclass
-class RepoSnapshot:
-    candidate: RepoCandidate
-    local_path: Path
-    tree: str
-    readme: str
-    key_files: dict[str, str]
-
-
-def ensure_dirs() -> None:
-    for path in (WORKSPACE, REPOS_DIR, REPORTS_DIR, INDEX_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-
-
-def load_langchain_or_exit() -> None:
-    missing: list[str] = []
-    for module, package in [
-        ("langchain_deepseek", "langchain-deepseek"),
-        ("langchain_text_splitters", "langchain-text-splitters"),
-        ("langchain_community", "langchain-community"),
-        ("langchain", "langchain"),
-    ]:
+def _check_deps():
+    missing = []
+    for mod, pkg in [("langchain_deepseek", "langchain-deepseek"), ("langchain_community", "langchain-community"),
+                     ("langchain", "langchain")]:
         try:
-            __import__(module)
+            __import__(mod)
         except ImportError:
-            missing.append(package)
+            missing.append(pkg)
     if missing:
-        joined = " ".join(sorted(set(missing)))
-        raise SystemExit(
-            "Current Python environment is missing LangChain dependencies. Please run:\n"
-            f"python -m pip install {joined}\n"
-            "or: python -m pip install -r requirements.txt"
-        )
+        raise SystemExit(f"pip install {' '.join(sorted(set(missing)))}")
 
 
-def get_llm(model_env: str, temperature: float = 0):
-    from langchain.chat_models import init_chat_model
-
-    model_name = os.getenv(model_env, "deepseek-chat")
-    provider = os.getenv("CHAT_MODEL_PROVIDER", "deepseek")
-    kwargs: dict[str, Any] = {"temperature": temperature}
-    if provider.lower() == "deepseek" and os.getenv("DEEPSEEK_BASE_URL"):
-        kwargs["base_url"] = os.getenv("DEEPSEEK_BASE_URL")
-    if ":" in model_name:
-        return init_chat_model(model_name, **kwargs)
-    return init_chat_model(model_name, model_provider=provider, **kwargs)
+def _cjk(text):
+    return any("一" <= c <= "鿿" for c in text)
 
 
-class LocalHashEmbeddings(Embeddings):
-    """Small deterministic embeddings for offline code RAG."""
-
-    def __init__(self, dimensions: int = 1024):
-        self.dimensions = dimensions
-
-    def _embed(self, text: str) -> list[float]:
-        vector = [0.0] * self.dimensions
-        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}|[一-鿿]{1,}", text.lower())
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-            index = int.from_bytes(digest[:4], "little") % self.dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[index] += sign
-        norm = sum(value * value for value in vector) ** 0.5 or 1.0
-        return [value / norm for value in vector]
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [self._embed(text) for text in texts]
-
-    def embed_query(self, text: str) -> list[float]:
-        return self._embed(text)
-
-    def __call__(self, text: str) -> list[float]:
-        return self.embed_query(text)
+def _arch_style(text):
+    l = text.lower()
+    return any(t in l for t in ("建筑", "立面", "architecture", "architectural", "facade")) and \
+           any(t in l for t in ("风格", "style")) and \
+           any(t in l for t in ("识别", "分类", "recognition", "classification"))
 
 
-async def structured_ainvoke(schema: type[BaseModel], model_env: str, system: str, user: str):
-    llm = get_llm(model_env)
-    structured = llm.with_structured_output(schema)
-    return await structured.ainvoke(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-    )
-
-
-def contains_cjk(text: str) -> bool:
-    return any("一" <= char <= "鿿" for char in text)
-
-
-def parse_requirement_spec(requirement: str) -> RequirementSpec:
-    raw = requirement.strip()
-    if raw.startswith("{"):
+def _parse_spec(requirement: str):
+    from core.models import RequirementSpec
+    r = requirement.strip()
+    if r.startswith("{"):
         try:
-            data = json.loads(raw)
-            ...
+            d = json.loads(r)
+            if isinstance(d, dict):
+                d.setdefault("raw_requirement", d.get("query", r))
+                return RequirementSpec(**d)
         except Exception:
             pass
-    return RequirementSpec(raw_requirement=raw, strict_terms=[raw], exclude_terms=["course notes only", "no source code"])
+    if _arch_style(r):
+        return RequirementSpec(raw_requirement=r, domain="architecture",
+            target_object=["architectural style", "building facade"],
+            task=["recognition", "classification"], modality=["image"],
+            strict_terms=["architectural style", "style recognition"],
+            related_terms=["facade segmentation", "architectural heritage classification"],
+            exclude_terms=["generic course", "software architecture", "awesome list", "LLM/agent"])
+    return RequirementSpec(raw_requirement=r, strict_terms=[r], exclude_terms=["no src"])
 
 
-def validate_runtime_config() -> None:
-    provider = os.getenv("CHAT_MODEL_PROVIDER", "deepseek").lower()
-    if provider == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"):
-        raise SystemExit("Missing DEEPSEEK_API_KEY.")
+def _quote(t):
+    t = t.strip()
+    return f'"{t}"' if " " in t and not (t.startswith('"') and t.endswith('"')) else t
 
 
-async def main():
-    # CLI entry point
-    validate_runtime_config()
-    ...
+async def _make_spec(requirement: str):
+    from core.models import RequirementSpec
+    from core.rag import structured_ainvoke
+    p = _parse_spec(requirement)
+    if requirement.strip().startswith("{") or _arch_style(requirement):
+        return p
+    try:
+        s = await structured_ainvoke(RequirementSpec, "SEARCH_MODEL",
+            "Decompose user requirement into structured fields. Default lang: Python.", f"Req: {requirement}")
+        s.raw_requirement = s.raw_requirement or requirement
+        s.language = s.language or ["Python"]
+        return s
+    except Exception:
+        return p
+
+
+def _mk_plan(spec):
+    from core.models import QueryPlan
+    lang = (spec.language or ["Python"])[0]
+    objs = spec.target_object or spec.strict_terms or [spec.raw_requirement]
+    tasks = spec.task or ["implementation"]
+    qs = []
+    for t in (spec.strict_terms or [f"{objs[0]} {tasks[0]}"])[:8]:
+        qs += [f"{_quote(t)} {lang}", f"{t} {lang} in:readme,description"]
+    for o in objs[:5]:
+        for t in tasks[:4]:
+            qs += [f"{_quote(o)} {t} {lang}", f"{o} {t} {lang} in:readme,description"]
+    if spec.allow_related:
+        for r in spec.related_terms[:8]:
+            qs += [f"{_quote(r)} {lang}", f"{r} {lang} in:readme,description"]
+    return QueryPlan(search_queries=list(dict.fromkeys(qs))[:30],
+        must_have=[f"domain:{spec.domain}", f"target:{objs[:3]}"],
+        exclude_if=spec.exclude_terms or ["awesome list only"])
+
+
+def _arch_plan(spec):
+    from core.models import QueryPlan
+    q = ['"architectural style recognition" python', '"architecture style classification" python',
+         '"building facade style classification" python', '"facade style classification" python',
+         'architectural style recognition python in:readme', '"facade segmentation" python']
+    return QueryPlan(search_queries=q, must_have=["visual recognition of architecture"],
+        exclude_if=["software architecture", "generic course", "awesome list"])
+
+
+async def _query_plan(requirement: str):
+    s = await _make_spec(requirement)
+    return _arch_plan(s) if _arch_style(s.raw_requirement) else _mk_plan(s)
+
+
+def _arch_match(text):
+    l = text.lower()
+    if any(t in l for t in ("software architecture", "awesome", "course", "lecture", "llm")):
+        return False
+    return any(t in l for t in ("architectural style", "building facade", "facade", "建筑", "立面"))
+
+
+async def _search(plan, max_results: int):
+    from core.github import search_github_api, search_github_mcp
+    seen, all_c = set(), []
+    per_q = max(3, min(20, max_results))
+    backend = os.getenv("GITHUB_SEARCH_BACKEND", "api").lower()
+    for q in plan.search_queries:
+        print(f"[search] {q}")
+        cs = None
+        if backend in {"mcp", "auto"}:
+            cs = await search_github_mcp(q, per_q)
+        if cs is None:
+            cs = search_github_api(q, per_q)
+        for c in cs:
+            if c.full_name and c.full_name not in seen:
+                txt = f"{c.full_name} {c.description} {c.language}".lower()
+                if _arch_style(" ".join(plan.search_queries)) and not _arch_match(txt):
+                    seen.add(c.full_name)
+                    continue
+                seen.add(c.full_name)
+                all_c.append(c)
+        if len(all_c) >= max_results:
+            break
+    return sorted(all_c, key=lambda x: x.stars, reverse=True)[:max_results]
+
+
+async def run(requirement: str, max_results: int, keep: int, refresh: bool):
+    _ensure_dirs()
+    _check_deps()
+    plan = await _query_plan(requirement)
+    print("[plan]", json.dumps(plan.model_dump(), ensure_ascii=False, indent=2))
+    candidates = await _search(plan, max_results)
+    if not candidates:
+        raise RuntimeError("No candidates. Try different keywords or configure GITHUB_TOKEN.")
+
+    from core.github import snapshot_repo
+    from core.rag import screen_snapshot, analyze_project, synthesize
+    from core.reporter import write_reports
+    from core.github import SKIP_DIRS as _SKIP
+
+    kept, rejected = [], []
+    for c in candidates:
+        print(f"[repo] downloading {c.full_name}")
+        snap = snapshot_repo(c, REPOS_DIR, refresh)
+        if snap is None:
+            continue
+        d = await screen_snapshot(requirement, plan, snap)
+        print(f"[screen] {c.full_name}: keep={d.keep} score={d.relevance_score}")
+        if d.keep:
+            kept.append(snap)
+        else:
+            rejected.append((c.full_name, d.reason))
+        if len(kept) >= keep:
+            break
+    if not kept:
+        raise RuntimeError(f"All excluded.\n" + "\n".join(f"- {n}: {r}" for n, r in rejected[:8]))
+
+    analyses = [await analyze_project(requirement, s, INDEX_DIR, _SKIP) for s in kept]
+    final = await synthesize(requirement, analyses)
+    return write_reports(requirement, final, analyses, REPORTS_DIR)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="GitHub Code Research Agent")
+    ap.add_argument("requirement", nargs="?", help="Natural language search query")
+    ap.add_argument("--spec-file", help="Path to structured requirement JSON")
+    ap.add_argument("--max-results", type=int, default=24)
+    ap.add_argument("--keep", type=int, default=8)
+    ap.add_argument("--refresh", action="store_true")
+    args = ap.parse_args()
+    if args.spec_file:
+        args.requirement = Path(args.spec_file).read_text(encoding="utf-8")
+    if not args.requirement:
+        args.requirement = input("Enter search requirement: ").strip()
+    if not args.requirement:
+        raise SystemExit("No input.")
+    _validate_config()
+    try:
+        md, jp = asyncio.run(run(args.requirement, args.max_results, args.keep, args.refresh))
+    except KeyboardInterrupt:
+        print("Cancelled.")
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"\n[error] {exc}")
+        if os.getenv("DEBUG"):
+            raise
+        raise SystemExit(1)
+    print(f"\nDone.\nMD: {md}\nJSON: {jp}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
